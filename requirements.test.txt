@@ -1,3 +1,8 @@
-pytest
-pytest-cov==2.9.0
-pytest-homeassistant-custom-component
+# Offline transport tests on Python 3.12; the HA version is a test baseline.
+homeassistant==2024.12.5
+# Bound the legacy HA Bluetooth dependency to avoid resolver backtracking.
+habluetooth==3.6.0
+pymodbus==3.11.2
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
+pytest-cov>=5,<8

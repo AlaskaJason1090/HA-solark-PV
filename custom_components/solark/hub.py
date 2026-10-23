@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -7,6 +8,8 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .config import ConnectionType, SolArkConfig
+from . import write_policy
+from homeassistant.exceptions import HomeAssistantError
 from .const import DEFAULT_MAX_STALE_DATA_AGE, MODBUS_EXCEPTIONS
 from .pymodbus_wrapper import ModbusClientWrapper, ModbusResponse
 from .register_map import (
@@ -60,6 +63,7 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
         self.device_id = config.device_id
 
         self._lock = threading.Lock()
+        self._write_lock = asyncio.Lock()
 
         self.has_inverter_data = False
         self.register_map: SolArkRegisterMap = SolArkRegisterMap()
@@ -129,6 +133,10 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
         self._process_register_range(self.register_map.GRIDL1N_V, self.register_map.GRIDLMTL1_P)  # R150 - R170
         self._process_register_range(self.register_map.GRIDLMTL2_P, self.register_map.PV3_P)  # R171 - R188
         self._process_register_range(self.register_map.BATT_P, self.register_map.GEN_FREQ)  # R190 - R196
+        # Unverified extended registers must not break existing telemetry polling.
+        for entry in self.register_map:
+            if entry.source_is_register_read and entry.key in write_policy.APPROVED_READ_KEYS:
+                self._process_register_range(entry)
 
     def _post_process_register_map_entries(self):
         """Post-process the register map entries after reading the raw values from the inverter."""
@@ -178,11 +186,19 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
 
         return data
 
-    def _process_register_range(self, start_register: RegisterMapEntry, end_register: RegisterMapEntry | None = None):
+    def _process_register_range(
+        self,
+        start_register: RegisterMapEntry,
+        end_register: RegisterMapEntry | None = None,
+    ):
         """Read the holding registers and decode the vlues for a range of RegisterMapEntry objects."""
 
         if end_register is None:
             end_register = start_register
+
+        # A read in this poll already failed; skip the rest instead of waiting out each timeout.
+        if self.register_map.is_error():
+            return
 
         register_count = end_register.address + end_register.register_length - start_register.address
 
@@ -193,7 +209,9 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
         # otherwise set error state on the register map
         if modbus_response.isError():
             _LOGGER.error(
-                "Processing registers %d-%d failed!", start_register.address, end_register.address + end_register.register_length - 1
+                "Processing registers %d-%d failed!",
+                start_register.address,
+                end_register.address + end_register.register_length - 1,
             )
             self.register_map.set_error()
             return
@@ -216,7 +234,11 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
             entry.register_value = self._decode_register_map_entry(decoder, entry)
 
             if entry.register_value is None:
-                _LOGGER.error("Failed to decode register %s with data type %s", entry.address, entry.data_type)
+                _LOGGER.error(
+                    "Failed to decode register %s with data type %s",
+                    entry.address,
+                    entry.data_type,
+                )
                 self.register_map.set_error()
                 return
 
@@ -279,3 +301,17 @@ class SolArkModbusHub(DataUpdateCoordinator[dict]):
             _LOGGER.warning("Reading holding registers Modbus error: %s", err)
 
         return result
+
+    async def async_write_register(self, address: int, value: int) -> bool:
+        """Write only approved settings; never retry an ambiguous write."""
+        write_policy.validate_raw_write(self.register_map, address, value)
+        async with self._write_lock:
+            result = await self._client.async_write_register(address, value, self.device_id)
+            if result.is_error:
+                raise HomeAssistantError(f"Inverter write failed; outcome may be unknown: {result.error}")
+            # Readback is required: an acknowledgement is not confirmation of applied state.
+            readback = await self._client.async_read_holding_registers(address, 1, self.device_id)
+            if readback.is_error or readback.registers != [value]:
+                raise HomeAssistantError("Inverter write readback failed or differs; outcome is unconfirmed")
+            await self.async_request_refresh()
+            return True

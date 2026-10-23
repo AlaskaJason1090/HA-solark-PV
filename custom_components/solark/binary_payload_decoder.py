@@ -3,9 +3,10 @@
 from array import array
 from struct import pack, unpack
 import warnings
+import logging
 
 from pymodbus.exceptions import ParameterException
-from pymodbus.logging import Log
+_LOGGER = logging.getLogger(__name__)
 
 
 class BinaryPayloadDecoder:
@@ -58,7 +59,7 @@ class BinaryPayloadDecoder:
         :raises ParameterException:
         """
         cls.deprecate()
-        Log.debug("{}", registers)
+        _LOGGER.debug("%s", registers)
         if isinstance(registers, list):  # repack into flat binary
             payload = pack(f"!{len(registers)}H", *registers)
             return cls(payload, byteorder, wordorder)
@@ -80,7 +81,7 @@ class BinaryPayloadDecoder:
             if self._wordorder == "<":
                 handle.reverse()
             handle = handle.tobytes()
-        Log.debug("handle: {}", handle)
+        _LOGGER.debug("handle: %s", handle)
         return handle
 
     def _decode(self, fmt: str, size: int, use_word_unpack: bool = False):
