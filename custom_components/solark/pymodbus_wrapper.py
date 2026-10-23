@@ -1,4 +1,4 @@
-"""Read-only, thread-safe, and async wrapper for PyModbus >=3.1.1 with full backwards compatibility.
+"""Thread-safe, and async wrapper for PyModbus >=3.1.1 with full backwards compatibility.
 
 Provides:
 - Automatic client import handling for TCP and Serial
@@ -22,7 +22,10 @@ Home Assistant Version  Pymodbus Version   Python Version
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+
+_LOGGER = logging.getLogger(__name__)
 
 import pymodbus
 from packaging import version
@@ -59,6 +62,11 @@ class ModbusResponse:
         """Return the list of registers or None if unavailable."""
         return getattr(self._response, "registers", None)
 
+    @property
+    def is_error(self) -> bool:
+        """Return True if the response indicates an error."""
+        return self.isError()
+
     def isError(self) -> bool:  # pylint: disable=invalid-name
         """Return True if the response indicates an error."""
         if self._response is None:
@@ -70,17 +78,26 @@ class ModbusResponse:
         # If no 'isError' method, consider it an error if it has no 'registers'
         return not hasattr(self._response, "registers")
 
+    @property
+    def error(self) -> str | None:
+        """Return the error string if the response indicates an error."""
+        if hasattr(self._response, "error_message"):
+            return getattr(self._response, "error_message")
+        if self.is_error:
+            return str(self._response)
+        return None
+
     def get_exception(self) -> Exception | None:
         """Return the exception if the response contains one."""
         return getattr(self._response, "error_message", None)
 
     def __repr__(self) -> str:
         """Return a string representation of the ModbusResponse."""
-        return f"<ModbusResponse error={self.isError()} registers={self.registers} exception={self.get_exception()}>"
+        return f"<ModbusResponse error={self.is_error} registers={self.registers} exception={self.get_exception()}>"
 
 
 class ModbusResponseError(ModbusResponse):
-    """Represents an error condition."""
+    """Wrapper for Modbus error response."""
 
     __slots__ = ("_exception",)
 
@@ -88,6 +105,16 @@ class ModbusResponseError(ModbusResponse):
         """Initialize a ModbusResponseError with an exception."""
         self._exception = exception
         super().__init__(None)
+
+    @property
+    def is_error(self) -> bool:
+        """Return True if the response indicates an error."""
+        return True
+
+    @property
+    def error(self) -> str:
+        """Return the error string."""
+        return str(self._exception)
 
     def isError(self) -> bool:  # pylint: disable=invalid-name
         """Return True if the response indicates an error."""
@@ -121,11 +148,12 @@ class ModbusClientWrapper:
                     port=serial_port,
                     baudrate=baudrate,
                     timeout=5,
+                    retries=0,
                 )
             else:
-                self._client = ModbusSerialClient(port=serial_port, baudrate=baudrate, timeout=5)
+                self._client = ModbusSerialClient(port=serial_port, baudrate=baudrate, timeout=5, retries=0)
         elif host is not None:
-            self._client = ModbusTcpClient(host=host, port=port, timeout=5)
+            self._client = ModbusTcpClient(host=host, port=port, timeout=5, retries=0)
         else:
             raise ValueError("Either host or serial_port must be provided")
 
@@ -157,9 +185,22 @@ class ModbusClientWrapper:
                 device_kw = self._get_device_id_param_name(device_id)
 
                 resp = self._client.read_holding_registers(address=address, count=count, **device_kw)  # type: ignore[arg-type]
-                return ModbusResponse(resp)
-            except (ModbusIOException, ConnectionException, ModbusException) as exc:
-                self._connected = False
+
+                result = ModbusResponse(resp)
+                if result.is_error:
+                    self._drop_connection()
+                elif result.registers is None or len(result.registers) != count:
+                    self._drop_connection()
+                    return ModbusResponseError(ValueError("Incomplete Modbus read response"))
+                return result
+            except (
+                ModbusIOException,
+                ConnectionException,
+                ModbusException,
+                OSError,
+            ) as exc:
+                # Close rather than just clear the flag: connect() is a no-op while pymodbus still holds a socket.
+                self._drop_connection()
                 return ModbusResponseError(exc)
 
     # ---- Async helper ----
@@ -177,11 +218,61 @@ class ModbusClientWrapper:
             return {"slave": device_id}  # 3.1.1 → 3.9.x
         return {"device_id": device_id}  # 3.10+
 
+    # ---- Sync write ----
+    def write_register(self, address: int, value: int, device_id: int) -> ModbusResponse:
+        """Write to a single register in a thread-safe way."""
+        if type(address) is not int or not 0 <= address <= 65535:
+            return ModbusResponseError(ValueError("Invalid register address"))
+        if type(value) is not int or not 0 <= value <= 65535:
+            return ModbusResponseError(ValueError("Invalid UINT16 value"))
+        if type(device_id) is not int or not 1 <= device_id <= 247:
+            return ModbusResponseError(ValueError("Writes require a unicast device ID"))
+        with self._lock:
+            try:
+                self._ensure_connected()
+                device_kw = self._get_device_id_param_name(device_id)
+                result = ModbusResponse(self._client.write_registers(address=address, values=[value], **device_kw))
+
+                if result.is_error:
+                    self._drop_connection()
+                    return result
+                response = result._response
+                # FC16 acknowledges address/count, not a list of register values.
+                if (
+                    getattr(response, "function_code", None) != 16
+                    or getattr(response, "address", None) != address
+                    or getattr(response, "count", None) != 1
+                ):
+                    self._drop_connection()
+                    return ModbusResponseError(ValueError("Mismatched FC16 acknowledgement"))
+                return result
+            except (
+                ModbusIOException,
+                ConnectionException,
+                ModbusException,
+                OSError,
+            ) as exc:
+                # Close rather than just clear the flag: connect() is a no-op while pymodbus still holds a socket.
+                self._drop_connection()
+                return ModbusResponseError(exc)
+
+    # ---- Async helper ----
+    async def async_write_register(self, address: int, value: int, device_id: int) -> ModbusResponse:
+        """Async wrapper for write_register."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.write_register, address, value, device_id)
+
     # ---- Close client ----
     def close(self) -> None:
         """Close the underlying client."""
         with self._lock:
-            try:
-                self._client.close()
-            finally:
-                self._connected = False
+            self._drop_connection()
+
+    def _drop_connection(self) -> None:
+        """Close the underlying client. The caller must hold the lock."""
+        try:
+            self._client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._connected = False
